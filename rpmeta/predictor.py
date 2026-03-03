@@ -51,6 +51,7 @@ class Predictor:
         with open(category_maps_path, encoding="utf-8") as f:
             category_maps = json.load(f)
 
+        model.prepare_for_prediction(category_maps)
         return cls(model, category_maps, config)
 
     def predict(self, input_data: InputRecord, behavior: ModelBehavior) -> int:

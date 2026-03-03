@@ -6,10 +6,18 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import joblib
 import numpy as np
+import pandas as pd
 from sklearn.compose import TransformedTargetRegressor
 
 from rpmeta.config import Config
-from rpmeta.constants import ModelEnum, ModelFileExtensions, ModelStorageBaseNames
+from rpmeta.constants import (
+    ALL_FEATURES,
+    CATEGORICAL_FEATURES,
+    NUMERICAL_FEATURES,
+    ModelEnum,
+    ModelFileExtensions,
+    ModelStorageBaseNames,
+)
 
 if TYPE_CHECKING:
     from lightgbm import LGBMRegressor
@@ -23,6 +31,7 @@ class Model(ABC):
     def __init__(self, name: str, config: Config) -> None:
         self.name = name.lower()
         self.config = config
+        self._loaded_regressor: Optional[TransformedTargetRegressor] = None
 
     def create_regressor(
         self,
@@ -151,8 +160,47 @@ class Model(ABC):
         regressor: TransformedTargetRegressor = joblib.load(skeleton_path, mmap_mode="r")
         regressor.regressor_ = model
 
+        self._loaded_regressor = regressor
         logger.info("Successfully loaded regressor from %s", path)
         return regressor
+
+    def prepare_for_prediction(
+        self,
+        category_maps: dict[str, list[str]],
+    ) -> None:
+        """
+        Pre-build encoding structures
+
+        Builds:
+        - ``_cat_encoders``: ``{column: {category_string: int_code}}`` dicts
+        - ``_feature_types``: ``["c", ..., "q", ...]`` list for feature types
+        - ``_inverse_func``: inverse target transform from the regressor
+        """
+        if self._loaded_regressor is None:
+            raise RuntimeError("Model not loaded. Call load_regressor() first.")
+
+        self._cat_encoders: dict[str, dict[str, int]] = {
+            col: {cat: code for code, cat in enumerate(cats)}
+            for col, cats in category_maps.items()
+        }
+        self._feature_types: list[str] = (
+            ["c"] * len(CATEGORICAL_FEATURES) + ["q"] * len(NUMERICAL_FEATURES)
+        )
+        self._inverse_func = self._loaded_regressor.inverse_func
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Make prediction on the given DataFrame.
+
+        Args:
+            df: DataFrame with features matching ALL_FEATURES
+
+        Returns:
+            Array of predictions with the inverse target transform already applied
+        """
+        if self._loaded_regressor is None:
+            raise RuntimeError("Model not loaded. Call load_regressor() first.")
+        return self._loaded_regressor.predict(df)
 
 
 class XGBoostModel(Model):
@@ -203,6 +251,45 @@ class XGBoostModel(Model):
         params = regressor.get_xgb_params()
         logger.debug("Loaded XGBoost model with booster params: %s", params)
         return regressor
+
+    def prepare_for_prediction(
+        self,
+        category_maps: dict[str, list[str]],
+    ) -> None:
+        super().prepare_for_prediction(category_maps)
+        self._booster = self._loaded_regressor.regressor_.get_booster()
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Optimized prediction that bypasses XGBoost's expensive Python-side
+        categorical string serialization by encoding features to integer codes
+        and constructing a DMatrix directly.
+        """
+        n_rows = len(df)
+        n_cols = len(ALL_FEATURES)
+        data = np.empty((n_rows, n_cols), dtype=np.float32)
+
+        for i, feat in enumerate(ALL_FEATURES):
+            col = df[feat]
+            if feat in self._cat_encoders:
+                if isinstance(col.dtype, pd.CategoricalDtype):
+                    codes = col.cat.codes.to_numpy(dtype=np.float32)
+                    codes[codes < 0] = np.nan
+                    data[:, i] = codes
+                else:
+                    data[:, i] = col.map(
+                        self._cat_encoders[feat],
+                    ).to_numpy(dtype=np.float32)
+            else:
+                data[:, i] = col.to_numpy(dtype=np.float32)
+
+        dmatrix = self.xgb.DMatrix(
+            data,
+            feature_names=list(ALL_FEATURES),
+            feature_types=self._feature_types,
+        )
+        raw_pred = self._booster.predict(dmatrix)
+        return self._inverse_func(raw_pred)
 
 
 class LightGBMModel(Model):
