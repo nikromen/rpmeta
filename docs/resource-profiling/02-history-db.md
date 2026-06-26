@@ -30,19 +30,24 @@ CREATE TABLE build_resource_history (
     build_id        INTEGER,
     recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    -- Resource metrics (hardware-independent)
-    peak_rss_gb         REAL NOT NULL,
-    cpu_user_seconds    REAL NOT NULL,
-    cpu_system_seconds  REAL NOT NULL,
-    io_read_gb          REAL NOT NULL,
-    io_write_gb         REAL NOT NULL,
-    net_download_gb     REAL NOT NULL,
+    -- Resource metrics (hardware-independent, from periodic cgroup sampling)
+    peak_rss_gb             REAL NOT NULL,
+    mean_rss_gb             REAL,
+    p95_rss_gb              REAL,
+    sustained_high_rss_pct  REAL,  -- fraction of samples > 80% of peak
+    cpu_user_seconds        REAL NOT NULL,
+    cpu_system_seconds      REAL NOT NULL,
+    cpu_utilization_ratio   REAL NOT NULL,
+    io_read_gb              REAL NOT NULL,
+    io_write_gb             REAL NOT NULL,
+    net_download_gb         REAL NOT NULL,
 
     -- Context (for analysis, not prediction input)
     wall_clock_seconds  INTEGER NOT NULL,
     builder_cores       INTEGER NOT NULL,
-    cpu_utilization_ratio REAL NOT NULL,  -- derived: cpu_total / (wall * cores)
-    builder_flavor      TEXT,  -- which flavor was used
+    builder_flavor      TEXT,
+    sample_count        INTEGER,  -- number of cgroup samples collected
+    sample_interval_seconds INTEGER,  -- sampling interval used
 
     -- Indexing
     CONSTRAINT idx_pkg_chroot UNIQUE (package_name, chroot, build_id)
@@ -83,6 +88,9 @@ def get_resource_profile(
 
     return ResourceProfile(
         peak_rss_gb=percentile([r.peak_rss_gb for r in rows], 95),
+        sustained_high_rss_pct=percentile(
+            [r.sustained_high_rss_pct for r in rows if r.sustained_high_rss_pct is not None], 95
+        ),
         cpu_utilization_ratio=percentile([r.cpu_utilization_ratio for r in rows], 95),
         io_total_gb=percentile([r.io_read_gb + r.io_write_gb for r in rows], 95),
         net_download_gb=percentile([r.net_download_gb for r in rows], 95),
@@ -124,14 +132,20 @@ POST /v1/report
     "chroot": "fedora-42-x86_64",
     "build_id": 12345678,
     "peak_rss_gb": 31.2,
+    "mean_rss_gb": 24.5,
+    "p95_rss_gb": 30.1,
+    "sustained_high_rss_pct": 0.85,
     "cpu_user_seconds": 11200,
     "cpu_system_seconds": 340,
+    "cpu_utilization_ratio": 0.81,
     "io_read_gb": 5.2,
     "io_write_gb": 12.8,
     "net_download_gb": 0.1,
     "wall_clock_seconds": 14400,
     "builder_cores": 4,
-    "builder_flavor": "mem-heavy"
+    "builder_flavor": "mem-heavy",
+    "sample_count": 1440,
+    "sample_interval_seconds": 10
 }
 ```
 

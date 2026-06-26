@@ -29,19 +29,25 @@ Target: `build_duration` (minutes, log1p-transformed)
 
 ## New: Multiple Resource Targets
 
-Instead of one target, predict 4 hardware-independent resource metrics:
+Instead of one target, predict multiple hardware-independent resource metrics.
+Thanks to periodic sampling during builds (see 01-data-collection.md), we have
+rich time-series derived features as targets:
 
 ```
 Same 13 features → [Model 1] → peak_rss_gb
-Same 13 features → [Model 2] → cpu_utilization_ratio
-Same 13 features → [Model 3] → io_total_gb
-Same 13 features → [Model 4] → net_download_gb
-(optionally)     → [Model 5] → build_duration (keep existing)
+Same 13 features → [Model 2] → sustained_high_rss_pct
+Same 13 features → [Model 3] → cpu_utilization_ratio
+Same 13 features → [Model 4] → io_total_gb
+Same 13 features → [Model 5] → net_download_gb
+(optionally)     → [Model 6] → build_duration (keep existing)
 ```
 
 ### Why These Targets Are Hardware-Independent
 
 - `peak_rss_gb`: Memory allocation is a property of the code, not the machine.
+- `sustained_high_rss_pct`: Whether peak memory is a brief spike or sustained
+  load is a code pattern, not hardware-dependent. Critical for distinguishing
+  "needs 32 GB RAM" vs "16 GB + swap is fine".
 - `cpu_utilization_ratio`: Fraction of available CPU used. A CPU-bound build
   (ratio ~0.95) is CPU-bound on any hardware.
 - `io_total_gb`: Data volume read/written doesn't depend on disk speed.
@@ -84,9 +90,10 @@ Recommendation: start with separate models for simplicity.
 # Existing
 TARGET = "build_duration"
 
-# New
+# New -- targets derived from periodic cgroup sampling (see 01-data-collection.md)
 RESOURCE_TARGETS = {
     "peak_rss_gb": {"transform": "log1p", "unit": "GB"},
+    "sustained_high_rss_pct": {"transform": "identity", "unit": "ratio"},
     "cpu_utilization_ratio": {"transform": "identity", "unit": "ratio"},
     "io_total_gb": {"transform": "sqrt", "unit": "GB"},
     "net_download_gb": {"transform": "sqrt", "unit": "GB"},
@@ -101,8 +108,9 @@ ALL_TARGETS = [TARGET] + list(RESOURCE_TARGETS.keys())
 class Record(InputRecord):
     build_duration: int = Field(gt=0)  # existing
 
-    # New resource fields
+    # New resource fields (from resource_stats.json summary)
     peak_rss_gb: float = Field(ge=0)
+    sustained_high_rss_pct: float = Field(ge=0, le=1)
     cpu_utilization_ratio: float = Field(ge=0, le=1)
     io_total_gb: float = Field(ge=0)
     net_download_gb: float = Field(ge=0)
@@ -188,6 +196,25 @@ class PredictionResponse(BaseModel):
 
 When richer data is available, additional features could improve predictions:
 
+### From time-series sampling (post-build, for training targets)
+
+The periodic sampler (01-data-collection.md) produces a time-series from which
+we can extract richer summary statistics beyond the basic ones:
+
+| Feature                    | Derived from                  | What it tells the model            |
+|----------------------------|-------------------------------|------------------------------------|
+| `mean_rss_gb`              | mean of sampled RSS           | Typical memory usage               |
+| `p95_rss_gb`               | 95th percentile of RSS        | Sustained-high memory              |
+| `rss_variance`             | variance of sampled RSS       | Stable vs spiky memory pattern     |
+| `sustained_high_rss_pct`   | % samples > 80% of peak RSS  | Spike vs sustained distinction     |
+| `cpu_mean_utilization`     | mean of per-interval CPU rate | Average CPU pressure               |
+| `cpu_p95_utilization`      | 95th percentile of CPU rate   | Peak CPU demand bursts             |
+| `io_rate_mean_mbps`        | mean I/O throughput per tick  | Sustained I/O load                 |
+| `io_rate_max_mbps`         | max I/O throughput per tick   | I/O burst intensity                |
+
+These are used as **training targets** (what the model predicts) and also
+stored in the history DB for direct p95 lookups.
+
 ### From spec file (static, pre-build)
 - `primary_language`: C/C++/Rust/Go/Python/Java/Perl/Other
 - `srpm_size_mb`: compressed source size
@@ -208,16 +235,27 @@ unknown packages where `package_name` isn't in category_maps.
 ### Extending the Fetcher
 
 Current fetchers (`KojiFetcher`, `CoprFetcher`) fetch build duration and
-hw_info. They need to be extended to also fetch `resource_stats.json` from
-build results (once Copr starts producing it).
+hw_info. They need to be extended to also fetch `resource_stats.json`
+(summary statistics) from build results once Copr starts producing it.
+Optionally, the fetcher can also fetch `resource_samples.jsonl` (raw
+time-series) for computing additional derived features during training.
 
 ```python
 class CoprFetcher(Fetcher):
     def _fetch_resource_stats(self, result_url: str) -> Optional[dict]:
+        """Fetch summary stats computed from periodic cgroup sampling."""
         url = f"{result_url}/resource_stats.json"
         resp = requests.get(url)
         if resp.status_code == 200:
             return resp.json()
+        return None
+
+    def _fetch_resource_samples(self, result_url: str) -> Optional[list[dict]]:
+        """Fetch raw time-series for advanced feature extraction."""
+        url = f"{result_url}/resource_samples.jsonl"
+        resp = requests.get(url)
+        if resp.status_code == 200:
+            return [json.loads(line) for line in resp.text.splitlines()]
         return None
 ```
 

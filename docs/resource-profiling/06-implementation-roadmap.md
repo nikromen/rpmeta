@@ -28,29 +28,38 @@ integration.
 
 ## Phase 0: Data Collection (Copr Side)
 
-**Goal:** Start collecting cgroup + network metrics for every build.
-No changes to build behavior -- just recording data for future use.
+**Goal:** Start collecting cgroup + network metrics for every build via
+periodic sampling. No changes to build behavior -- just recording data.
 
-**Where:** `copr-rpmbuild` or `copr-backend` `BuildBackgroundWorker`
+**Where:** `copr-rpmbuild`, wrapping `MockBuilder.run()`
 
 **What to implement:**
-1. Discover mock process cgroup path from `/proc/<pid>/cgroup`
-2. Read `cpu.stat`, `memory.peak`, `memory.swap.current`, `io.stat` before
-   and after mock invocation
-3. Read `/proc/net/dev` before and after for network bytes
-4. Compute deltas and derived metrics (cpu_utilization_ratio)
-5. Write `resource_stats.json` to build results directory
+1. `CgroupSampler` class: background daemon thread that reads cgroup metrics
+   (`memory.current`, `memory.swap.current`, `cpu.stat`, `io.stat`,
+   `*.pressure`) every 10 seconds throughout the build
+2. Discover mock process cgroup path from `/proc/<pid>/cgroup`
+3. Read `/proc/net/dev` before and after build for network bytes
+4. After build: compute summary statistics from time-series (peak, mean,
+   p95 RSS, cpu_utilization_ratio, sustained_high_rss_pct, I/O totals)
+5. Read `memory.peak` once at end (kernel's high-water mark)
+6. Write `resource_stats.json` (summary) to results directory
+7. Write `resource_samples.jsonl` (raw time-series) to results directory
 
-**Estimated effort:** 2-3 days. Simple file reads, no external dependencies.
+**Estimated effort:** 3-4 days. Slightly more than just start/end reads
+due to the background thread, but no external dependencies.
 
-**Testing:** Run a few builds, verify `resource_stats.json` is produced with
-reasonable values. Compare peak_rss against `free -m` observations.
+**Testing:** Run a few builds, verify both output files are produced with
+reasonable values. Compare `peak_rss_gb` against `free -m` observations.
+Verify `sustained_high_rss_pct` distinguishes a linking spike from a
+sustained-memory build.
 
 **Risks:**
 - cgroup path discovery may vary between systemd versions and mock
   isolation modes (nspawn vs simple chroot). Test on actual builders.
 - Some metrics may not be available on older kernels (cgroups v1 has
   different file layout). Copr builders should be on recent Fedora (v2).
+- Thread safety: the sampler thread only reads kernel files and appends to
+  a list, no shared mutable state with the build process.
 
 ---
 
@@ -183,18 +192,18 @@ Phase 3 (flavor recommendation in predict response).
 
 | Phase | What                    | Effort   | Depends On | Can Start    |
 |-------|-------------------------|----------|------------|--------------|
-| 0     | Data collection (Copr)  | 2-3 days | Nothing    | Immediately  |
+| 0     | Data collection (Copr)  | 3-4 days | Nothing    | Immediately  |
 | 1     | History DB (rpmeta)     | 3-5 days | Nothing    | Immediately  |
 | 2     | Spec analysis (rpmeta)  | 2-3 days | Nothing    | Immediately  |
 | 3     | Cost optimizer (rpmeta) | 2-3 days | Phase 1+2  | After 1 or 2 |
 | 4     | ML retraining (rpmeta)  | 5-7 days | Phase 0    | After months of data |
 | 5     | Backend integration     | 3-4 days | Phase 0+1+3| After 0,1,3  |
 
-**Minimum viable system:** Phases 0 + 1 + 3 + 5 = ~12-15 days of work.
-This gives you: data collection → history-based predictions → multi-flavor
-selection → backend integration.
+**Minimum viable system:** Phases 0 + 1 + 3 + 5 = ~13-16 days of work.
+This gives you: periodic cgroup sampling → history-based predictions →
+multi-flavor selection → backend integration.
 
-**Full system (with ML + spec analysis):** All phases = ~20-25 days of work,
+**Full system (with ML + spec analysis):** All phases = ~20-26 days of work,
 spread over months (waiting for data collection).
 
 ## Considered and Rejected Approaches

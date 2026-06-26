@@ -70,8 +70,8 @@ network-heavy builds (Rust, Go, Node) from network-light builds (C/C++).
 
 ### Build Phase Timing
 
-Mock/rpmbuild executes builds in well-defined phases. Capturing per-phase
-timing and resource snapshots gives much richer data:
+Mock/rpmbuild executes builds in well-defined phases with different resource
+characteristics:
 
 | Phase        | rpmbuild section | Resource characteristics                    |
 |--------------|------------------|---------------------------------------------|
@@ -82,132 +82,287 @@ timing and resource snapshots gives much richer data:
 | %install     | `%install`       | I/O (copying files), usually fast           |
 | packaging    | (rpmbuild)       | I/O + CPU (compression of RPMs)             |
 
-**How to capture phases:** rpmbuild outputs phase markers to build.log:
-```
-Executing(%prep): ...
-Executing(%build): ...
-Executing(%check): ...
-Executing(%install): ...
-```
+**Per-phase timing is NOT feasible from build.log.** While rpmbuild outputs
+phase markers like `Executing(%build): /bin/sh -e /var/tmp/rpm-tmp.XXX`,
+these lines have **no absolute timestamps**. The log is raw rpmbuild stdout
+with no datetime prefixes. mock's own messages (`Start:`, `Finish:`,
+`INFO: Done(...)`) provide only aggregate timing for the whole build, not
+per-phase breakdowns.
 
-Parse these timestamps from the build log post-build, correlate with cgroup
-metric snapshots taken during the build (periodic sampling or per-phase
-start/end readings).
+**Instead, rely on periodic sampling** (see Implementation below). By
+correlating time-series resource snapshots with the build timeline, we
+can indirectly observe phase transitions -- e.g. a sudden CPU spike after
+a network-heavy period marks the transition from dep_install to %build.
+This is far more useful than log parsing and works without any changes to
+rpmbuild or mock.
 
-**Phase-level data is a stretch goal.** Start with aggregate (whole-build)
-metrics. Add per-phase breakdown later when the infrastructure is mature.
+**Per-phase hooks are a future possibility** if mock adds plugin hooks for
+individual rpmbuild sections (currently it only has `prebuild`/`postbuild`
+for the whole invocation).
 
 ## Implementation
 
+### Approach: Periodic Sampling (Time-Series)
+
+Instead of reading cgroup metrics once before and once after the build,
+use **periodic sampling** -- a background thread reads all metrics every
+N seconds throughout the build. This produces a time-series that is far more
+informative than start/end deltas.
+
+**Why periodic sampling is better than start/end snapshots:**
+
+1. **Distinguishes spikes from sustained usage.** Two packages may both show
+   `memory.peak = 30 GB`, but one uses 30 GB for 3 hours (needs a big builder)
+   while the other spikes to 30 GB for 10 seconds during linking (can survive
+   on a medium builder with swap). Only the time-series reveals this.
+
+2. **Identifies bottleneck transitions.** Builds are not homogeneous -- they go
+   through network-heavy (dep install), CPU-heavy (compile), memory-heavy
+   (linking), and I/O-heavy (packaging) phases. The time-series shows when each
+   resource is the bottleneck without needing per-phase hooks in mock.
+
+3. **Richer features for ML.** From a time-series we can compute summary
+   statistics (peak, mean, p95, variance, sustained-high duration) that are
+   far more predictive than just peak values.
+
+4. **Negligible overhead.** Reading 5 cgroup files every 10 seconds costs
+   <0.5 ms per sample. A 4-hour build = 1440 samples x ~100 bytes = ~144 KB.
+   Effectively zero impact on build performance.
+
 ### Where to Collect
 
-The metrics should be collected in **copr-rpmbuild** or
-**copr-backend** (the `BuildBackgroundWorker`), as close to the mock
-invocation as possible.
+The sampler runs in **copr-rpmbuild**, wrapping `MockBuilder.run()`. It runs
+as a daemon thread that terminates when the build finishes.
+
+### What to Sample (Per Tick)
+
+| Metric             | Source file              | Notes                          |
+|--------------------|--------------------------|--------------------------------|
+| RSS (current)      | `memory.current`         | Single integer                 |
+| Swap (current)     | `memory.swap.current`    | Single integer                 |
+| CPU cumulative     | `cpu.stat` `user_usec`   | Delta from previous sample     |
+| CPU cumulative     | `cpu.stat` `system_usec` | Delta from previous sample     |
+| I/O cumulative     | `io.stat` `rbytes`       | Delta from previous sample     |
+| I/O cumulative     | `io.stat` `wbytes`       | Delta from previous sample     |
+| CPU pressure        | `cpu.pressure` `some total` | Cumulative microseconds     |
+| Memory pressure    | `memory.pressure` `some total` | Cumulative microseconds |
+| I/O pressure       | `io.pressure` `some total` | Cumulative microseconds      |
+
+Plus read once at the end (kernel's own high-water mark, more precise than
+our sampled maximum):
+- `memory.peak` -- absolute peak RSS since cgroup creation
+
+### Sampling Implementation
 
 ```python
-# Pseudocode for the collection wrapper
+import threading
+import time
+from pathlib import Path
 
-class CgroupMetrics:
-    def __init__(self, cgroup_path: str):
+SAMPLE_INTERVAL = 10  # seconds
+
+class CgroupSampler:
+    """Background thread that samples cgroup metrics periodically."""
+
+    def __init__(self, cgroup_path: str, interval: int = SAMPLE_INTERVAL):
         self.cgroup_path = Path(cgroup_path)
+        self.interval = interval
+        self.samples: list[dict] = []
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
 
-    def read_cpu_stat(self) -> dict:
-        content = (self.cgroup_path / "cpu.stat").read_text()
-        stats = {}
-        for line in content.splitlines():
-            key, value = line.split()
-            stats[key] = int(value)
-        return stats
+    def start(self):
+        self._thread.start()
 
-    def read_memory_peak(self) -> int:
-        return int((self.cgroup_path / "memory.peak").read_text().strip())
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=5)
 
-    def read_io_stat(self) -> dict:
-        # io.stat format: "MAJ:MIN rbytes=X wbytes=Y rios=Z wios=W"
-        ...
+    def _run(self):
+        while not self._stop_event.is_set():
+            self.samples.append(self._take_sample())
+            self._stop_event.wait(self.interval)
 
-    def snapshot(self) -> ResourceSnapshot:
-        return ResourceSnapshot(
-            cpu=self.read_cpu_stat(),
-            memory_peak=self.read_memory_peak(),
-            memory_swap=self.read_memory_swap(),
-            io=self.read_io_stat(),
+    def _take_sample(self) -> dict:
+        return {
+            "t": time.time(),
+            "rss_bytes": self._read_int("memory.current"),
+            "swap_bytes": self._read_int("memory.swap.current"),
+            "cpu_user_usec": self._read_cpu_field("user_usec"),
+            "cpu_system_usec": self._read_cpu_field("system_usec"),
+            "io_rbytes": self._read_io_field("rbytes"),
+            "io_wbytes": self._read_io_field("wbytes"),
+            "cpu_pressure_total": self._read_pressure("cpu.pressure"),
+            "mem_pressure_total": self._read_pressure("memory.pressure"),
+            "io_pressure_total": self._read_pressure("io.pressure"),
+        }
+
+    def _read_int(self, filename: str) -> int:
+        try:
+            return int((self.cgroup_path / filename).read_text().strip())
+        except (FileNotFoundError, ValueError):
+            return 0
+
+    # ... similar helpers for cpu.stat, io.stat, *.pressure parsing ...
+
+    def compute_summary(self, wall_clock_seconds: float,
+                        cores: int) -> dict:
+        """Compute summary statistics from collected time-series."""
+        if not self.samples:
+            return {}
+
+        rss_values = [s["rss_bytes"] for s in self.samples]
+        memory_peak = self._read_int("memory.peak")  # kernel HWM
+        GiB = 1024 ** 3
+
+        cpu_total = (
+            (self.samples[-1]["cpu_user_usec"] - self.samples[0]["cpu_user_usec"])
+            + (self.samples[-1]["cpu_system_usec"] - self.samples[0]["cpu_system_usec"])
         )
 
+        return {
+            # Peak values (hard constraints -- must not exceed)
+            "peak_rss_gb": memory_peak / GiB,
+            "peak_sampled_rss_gb": max(rss_values) / GiB,
 
-# Before build:
-pre_snapshot = metrics.snapshot()
-pre_net = read_proc_net_dev()
+            # Sustained usage (spike vs sustained distinction)
+            "mean_rss_gb": (sum(rss_values) / len(rss_values)) / GiB,
+            "p95_rss_gb": sorted(rss_values)[int(len(rss_values) * 0.95)] / GiB,
+            "sustained_high_rss_pct": sum(
+                1 for v in rss_values if v > 0.8 * memory_peak
+            ) / len(rss_values),
 
-# ... mock runs the build ...
+            # CPU totals and utilization
+            "cpu_user_seconds": (self.samples[-1]["cpu_user_usec"]
+                                 - self.samples[0]["cpu_user_usec"]) / 1e6,
+            "cpu_system_seconds": (self.samples[-1]["cpu_system_usec"]
+                                   - self.samples[0]["cpu_system_usec"]) / 1e6,
+            "cpu_utilization_ratio": cpu_total / (wall_clock_seconds * 1e6 * cores),
 
-# After build:
-post_snapshot = metrics.snapshot()
-post_net = read_proc_net_dev()
+            # I/O totals
+            "io_read_gb": (self.samples[-1]["io_rbytes"]
+                           - self.samples[0]["io_rbytes"]) / GiB,
+            "io_write_gb": (self.samples[-1]["io_wbytes"]
+                            - self.samples[0]["io_wbytes"]) / GiB,
 
-# Compute deltas:
-resource_stats = ResourceStats(
-    peak_rss_gb=post_snapshot.memory_peak / GiB,
-    cpu_user_seconds=(post_snapshot.cpu["user_usec"] - pre_snapshot.cpu["user_usec"]) / 1e6,
-    cpu_system_seconds=(post_snapshot.cpu["system_usec"] - pre_snapshot.cpu["system_usec"]) / 1e6,
-    io_read_gb=(post_io.rbytes - pre_io.rbytes) / GiB,
-    io_write_gb=(post_io.wbytes - pre_io.wbytes) / GiB,
-    net_download_gb=(post_net.rx_bytes - pre_net.rx_bytes) / GiB,
-    wall_clock_seconds=ended_on - started_on,
-    cores=builder_cores,
-)
-
-# Write to results alongside results.json:
-write_json(results_dir / "resource_stats.json", resource_stats)
+            # Build metadata
+            "wall_clock_seconds": wall_clock_seconds,
+            "builder_cores": cores,
+            "sample_count": len(self.samples),
+            "sample_interval_seconds": self.interval,
+        }
 ```
 
-### Output Format (`resource_stats.json`)
+### Usage in copr-rpmbuild
+
+```python
+# In MockBuilder.run() or its caller:
+
+sampler = CgroupSampler(discover_cgroup_path(mock_pid))
+pre_net = read_proc_net_dev()
+sampler.start()
+
+try:
+    mock.run_build(spec, sources, ...)  # blocking
+finally:
+    sampler.stop()
+    post_net = read_proc_net_dev()
+
+    summary = sampler.compute_summary(wall_clock_seconds, builder_cores)
+    summary["net_download_gb"] = (post_net.rx_bytes - pre_net.rx_bytes) / GiB
+
+    # Write summary stats (for /report endpoint and fetcher)
+    write_json(results_dir / "resource_stats.json", summary)
+
+    # Write raw time-series (for detailed analysis and future model improvement)
+    write_jsonl(results_dir / "resource_samples.jsonl", sampler.samples)
+```
+
+### Output Files
+
+Two files are written to the build results directory:
+
+#### `resource_stats.json` -- Summary statistics (primary)
+
+Used by the `/report` endpoint and the fetcher for model training:
 
 ```json
 {
   "peak_rss_gb": 28.4,
+  "peak_sampled_rss_gb": 27.9,
+  "mean_rss_gb": 12.3,
+  "p95_rss_gb": 26.1,
+  "sustained_high_rss_pct": 0.35,
   "cpu_user_seconds": 11200,
   "cpu_system_seconds": 340,
+  "cpu_utilization_ratio": 0.81,
   "io_read_gb": 5.2,
   "io_write_gb": 12.8,
   "net_download_gb": 1.3,
   "wall_clock_seconds": 14400,
   "builder_cores": 4,
-  "cpu_utilization_ratio": 0.81,
-  "memory_pressure_avg": 0.02,
-  "io_pressure_avg": 0.15
+  "sample_count": 1440,
+  "sample_interval_seconds": 10
 }
 ```
 
+Key fields for spike vs sustained distinction:
+- `peak_rss_gb = 28.4, sustained_high_rss_pct = 0.95` -> sustained, needs 32 GB
+- `peak_rss_gb = 28.4, sustained_high_rss_pct = 0.02` -> spike, 16 GB + swap OK
+
+#### `resource_samples.jsonl` -- Raw time-series (secondary)
+
+One JSON object per line, one line per sample. Used for detailed post-hoc
+analysis, debugging slow builds, and computing additional ML features:
+
+```json
+{"t":1719300000.0,"rss_bytes":2147483648,"swap_bytes":0,"cpu_user_usec":1000000,"cpu_system_usec":50000,"io_rbytes":104857600,"io_wbytes":0}
+{"t":1719300010.0,"rss_bytes":4294967296,"swap_bytes":0,"cpu_user_usec":8500000,"cpu_system_usec":120000,"io_rbytes":209715200,"io_wbytes":52428800}
+```
+
+This file can be large for long builds (~144 KB for 4 hours at 10s interval)
+but is still negligible compared to build logs and RPM artifacts.
+
 ### Reporting to rpmeta
 
-After the build completes, Copr backend sends the resource stats to rpmeta
-via a new `POST /report` endpoint (see 02-history-db.md). This is the same
-endpoint discussed in the EMA plan, but with richer data.
+After the build completes, Copr backend sends the summary stats from
+`resource_stats.json` to rpmeta via a new `POST /report` endpoint
+(see 02-history-db.md). Only the summary is sent -- the raw time-series
+stays in the results directory for offline analysis and fetcher access.
 
 ### cgroup Path Discovery
 
-Mock runs rpmbuild in a chroot. On a systemd-based system, the build process
-is in a cgroup like:
+Mock runs rpmbuild inside a chroot using systemd-nspawn. The build process
+lives in a cgroup hierarchy. The exact path depends on the environment:
 
 ```
+# Under a systemd service (typical Copr builder):
+/sys/fs/cgroup/system.slice/copr-backend-build-<id>.service/
+
+# Under a user session:
 /sys/fs/cgroup/user.slice/user-<uid>.slice/session-<sid>.scope/
 ```
 
-Or if running under a systemd service (as in Copr):
-```
-/sys/fs/cgroup/system.slice/copr-backend-build-<id>.service/
-```
+The path is discovered from `/proc/<pid>/cgroup` of the mock process:
 
-The exact path can be discovered from `/proc/<pid>/cgroup` of the mock process.
+```python
+def discover_cgroup_path(pid: int) -> str:
+    with open(f"/proc/{pid}/cgroup") as f:
+        for line in f:
+            # cgroups v2: single line "0::/path"
+            if line.startswith("0::"):
+                return "/sys/fs/cgroup" + line.strip().split("::")[1]
+    raise RuntimeError(f"Cannot find cgroup for pid {pid}")
+```
 
 ### Overhead Considerations
 
-- Reading cgroup files: **negligible** (<1 ms per read, kernel-maintained)
-- `/proc/net/dev`: **negligible** (single file read)
-- Periodic sampling (if desired): 1 read/10s = 0.0001% overhead
-- Writing `resource_stats.json`: **negligible** (<1 KB file)
+- Reading 5 cgroup files per sample: **<0.5 ms** (kernel-maintained counters)
+- `/proc/net/dev` read (start + end only): **negligible**
+- Sampling thread CPU usage: **<0.004%** (0.5 ms every 10 seconds)
+- `resource_stats.json` size: **<1 KB**
+- `resource_samples.jsonl` size: **~36 bytes/sample x 6/min = ~144 KB for 4 hours**
+- In-process memory: **<1 MB** (list of sample dicts)
 
 Total overhead: effectively zero. These are kernel-maintained counters, not
 application-level instrumentation.

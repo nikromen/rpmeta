@@ -75,11 +75,13 @@ Replace the single "predict build time" model with a multi-layered system:
               │  (e.g. "mem-heavy") │
               └─────────────────────┘
 
-                    After build:
+                   During + after build:
               ┌─────────────────────┐
-              │  Collect cgroup +   │
-              │  network + phase    │──▶ History DB update
-              │  metrics            │──▶ Retrain queue
+              │  Periodic cgroup    │
+              │  sampling (every    │──▶ resource_samples.jsonl
+              │  10s: CPU, RAM,     │──▶ resource_stats.json (summary)
+              │  I/O, pressure)     │──▶ History DB update via /report
+              │  + network delta    │──▶ Retrain queue
               └─────────────────────┘
 ```
 
@@ -88,13 +90,14 @@ Replace the single "predict build time" model with a multi-layered system:
 Build time depends on hardware (faster CPU = less time). But resource
 **consumption** is a property of the PACKAGE:
 
-| Metric              | Depends on HW? | Why                                      |
-|---------------------|-----------------|------------------------------------------|
-| peak_rss_gb         | No              | Code allocates same memory on any machine |
-| io_write_gb         | No              | Same data written regardless of disk speed |
-| cpu_utilization     | No              | Ratio of CPU time to wall-clock * cores   |
-| network_download_gb | No              | Same crates/modules downloaded anywhere   |
-| build_duration      | YES             | Faster CPU/more cores = less time         |
+| Metric                | Depends on HW? | Why                                      |
+|-----------------------|-----------------|------------------------------------------|
+| peak_rss_gb           | No              | Code allocates same memory on any machine |
+| sustained_high_rss_pct| No              | Spike vs sustained pattern is code-driven |
+| io_write_gb           | No              | Same data written regardless of disk speed |
+| cpu_utilization       | No              | Ratio of CPU time to wall-clock * cores   |
+| network_download_gb   | No              | Same crates/modules downloaded anywhere   |
+| build_duration        | YES             | Faster CPU/more cores = less time         |
 
 Because resource profiles are hardware-independent, they do NOT suffer from the
 feedback loop problem that plagues time-based predictions. A package that
